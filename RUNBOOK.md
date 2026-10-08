@@ -6,6 +6,8 @@ Companion to `AUTORESEARCH_PLAN.md`. Ordered, checkable steps from zero → firs
 
 **Status (2026-10-07):** plantbench **#60** reworked to the **train‑based** split (`train_validation_split` + `score_validation`) — `a5c0aacd` is pushed and **`plantbench 1.41.0rc1` is live on repoforge** (`build-and-publish` ✓; the only red check is the by‑design pre‑release merge‑guard). Two further #60 commits are staged (unpushed): a `score_validation` error‑hardening fix + a bump to **`1.41.0rc2`** — the next push republishes the package with the fix. bg-ai **#59** (the FOMO harness) is rewired to call the new API. bg-infra **#307 is merged** and **Flux is bootstrapped** on italynorth `bg-kubernetes` (namespace/SA/RBAC/quota + data PVC reconciling); the orchestrator Deployment is stacked in **#313** (`replicas: 0`, unmerged). No cluster‑GPU/S3/image step has run yet; the rest is a checklist, not a record of done work.
 
+**Status update (2026-10-08 — big progress):** rc4 frozen image built + locked (Phase 3 ✅); DREAM data staged on the RWO + RWX PVCs (Phase 4 ✅); **σ₀ measured — μ₀ = 0.6981, σ₀ = 0.00109, +5 % bar = 0.7330** (Phase 7 ✅). Harness code (`_train_and_predict` + FOMO-Batch `candidate.py` + rc5 overhead optimisation + `job-template` deadline/RWX) committed on bg-ai `feat/autoresearch-harness` (3 commits, **unpushed**). Orchestrator Deployment + RWX PVC prepared as a clean bg-infra PR branch **`feat/autoresearch-rwx-data`** (off *current* main; 3 files, 0 deletions). **REMAINING:** push bg-ai + build the rc5 image; push + merge the bg-infra PR → brain deploys; create the brain's Secret + build the orchestrator image (Phase 6); safety drill (Phase 8); run the campaign (Phase 9, beat 0.7330).
+
 **Owner legend:** `[H]` human (you/admin) · `[CI]` CI pipeline · `[AG]` the headless agent (only after setup). The agent never does `[H]`/`[CI]` steps — that separation is the safety model.
 
 **PRs this runbook relates to:**
@@ -40,23 +42,22 @@ Companion to `AUTORESEARCH_PLAN.md`. Ordered, checkable steps from zero → firs
 - [ ] `[H]` Pin FOMO's `plantbench` to `==1.41.0rc2` (the `TODO(gated)` in `ml/bg-fomo/pyproject.toml`; `>=` won't pick a pre‑release), `uv lock`, then commit #59. (v1 runs off the #59 branch baked into the image — it need not merge to bg-ai master.)
   - Verify: `autoresearch_dream.yaml` carries `split: {seed, val_fraction}`; no `manifest_sha256`.
 
-## Phase 3 — Build + lock the frozen image
-- [ ] `[H/CI]` `az acr build`/`docker build` + push `biographicaregistry.azurecr.io/autoresearch-fomo:<tag>` (AcrPush — you/CI, never the agent).
-- [ ] `[H]` Lock the tag immutable: `az acr repository update --name biographicaregistry --image autoresearch-fomo:<tag> --write-enabled false`.
-  - Verify: `az acr repository show ... --query changeableAttributes.writeEnabled` → `false`; the agent identity has **no** AcrPush.
+## Phase 3 — Build + lock the frozen image ✅ done (`dream-rc4`)
+- [x] `[H]` Built + pushed `biographicaregistry.azurecr.io/autoresearch-fomo:dream-rc4` via local `docker buildx --platform linux/amd64 --push` with the repoforge token as a BuildKit secret (az acr build can't do the Dockerfile's `--mount=type=secret`). Bakes the implemented `_train_and_predict` + FOMO-Batch candidate.
+- [x] `[H]` Locked the tag immutable (`writeEnabled=false`, digest `sha256:a996d2e7…`); the agent identity has no AcrPush.
+- [ ] `[H]` **rc5** rebuild once the overhead optimisation (committed on `feat/autoresearch-harness`) is pushed — new tag `dream-rc5` (rc4 is locked).
 
-## Phase 4 — Mirror the data snapshot into Azure (italynorth)
-- [ ] `[H]` One-time copy DREAM snapshot (~0.6 GB) from `s3://bg-data-prd/...` → Azure Blob/managed disk in **italynorth** (use the existing `bg-dagster-prod` AWS role; keyless Azure write). (Plan §5)
-- [ ] `[H]` Lay out on the volume as `plantbench`'s loader/cache expects: the DREAM snapshot (`train`, `test`, `test_labels`) under `/data/dream_2025-06-02_14-16-47/`. The label table (`test_labels`) covers the train pairs too, so `score_validation` reads the `validation` labels from it; the `test` inputs are needed only for the human-only locked-test `evaluate()`.
-  - Verify: file count/sizes match the snapshot. Test-set isolation is **behavioural** (the frozen entrypoint only ever calls `train_validation_split` + `score_validation`, never touching the `test` pairs; the human-only whole-test `evaluate()` is a separate step).
+## Phase 4 — Mirror the data snapshot into Azure (italynorth) ✅ done
+- [x] `[H]` DREAM snapshot (565M: `config.yaml` + `train` + `test_labels` parquet) staged on the RWO PVC `autoresearch-data-ro` (loaded locally with my AWS creds → tar/`kubectl exec` into a credential-less sleeper; NO AWS creds in-cluster), then copied **RWO→RWX** into `autoresearch-data-rwx` (azurefile-nfs, for concurrent Jobs) via an in-cluster copy Job. Layout: `/data/DREAMSequence2ExpressionPrediction__v_2025-06-02_14-16-47/{config.yaml,train,test_labels}`.
+  - Verified: credential-less pods read `/data` (`PLANTBENCH_HOME=/data`), no S3; test-set isolation is **behavioural** (the entrypoint only calls `train_validation_split`/`score_validation`). (v2: drop the mirror, read S3 directly via the Dagster-style Azure→AWS OIDC federation — see AUTORESEARCH_PLAN §5.)
 
 ## Phase 5 — Cluster access control → open + merge PR-B (`bg-infra`)
 - [x] `[H]` Branch `bg-infra` (`feat/autoresearch-namespace-rbac`, PR #307).
 - [x] `[H]` Add the namespace infra under `clusters/prod-azure/namespaces/autoresearch/`: `serviceaccount.yaml` (SA `autoresearch-runner`, credential-less in v1), `rbac.yaml` (Role: `batch/jobs` CRUD + `pods,pods/log,pods/status` + `configmaps` + `resourcequotas` read; RoleBinding to the SA), `resourcequota.yaml` (`requests.nvidia.com/gpu: "1"`, cpu/mem/pods caps), the read-only data `PersistentVolumeClaim` (**PR #307**), and `deployment.yaml` — the orchestrator brain, `replicas: 0` until Phase 6 (**PR #313**, stacked on #307). (Plan §6/§7)
 - [x] `[H]` Wire into Flux (`flux-infra-azure/autoresearch-kustomization.yaml` + the namespace `kustomization.yaml` resource list). (PR #307 + #313)
 - [x] `[H]` PR #307 **merged** + Flux **bootstrapped** on italynorth (`prod-azure-autoresearch` Kustomization live; namespace/SA/RBAC/quota + data PVC reconciling — the PVC stays Pending until a Job mounts it).
-- [ ] `[H]` Review + merge **#313** (orchestrator Deployment, `replicas: 0`); let Flux apply (or `flux reconcile`).
-  - Verify: `kubectl -n autoresearch get sa,role,rolebinding,resourcequota,pvc` all present; the runner identity can create Jobs **only** in `autoresearch` (`kubectl auth can-i create jobs -n autoresearch --as=...` → yes; `--as=... -n dagster-cloud` → no).
+- [ ] `[H]` Land the orchestrator Deployment + RWX PVC on `main`. ⚠️ Do **not** merge #313's branch `feat/autoresearch-namespace-rbac` — it is 9 commits BEHIND main and would revert unrelated azure/orchard changes. Instead push the clean, rebased-on-main bg-infra branch **`feat/autoresearch-rwx-data`** and open a PR → main (diff = 3 files: `deployment.yaml` replicas:0 + `data-pvc-rwx.yaml` + kustomization; **0 deletions**); merge → Flux applies.
+  - Verify: `kubectl -n autoresearch get deploy,sa,role,rolebinding,resourcequota,pvc` all present; the runner identity can create Jobs **only** in `autoresearch` (`kubectl auth can-i create jobs -n autoresearch --as=...` → yes; `--as=... -n dagster-cloud` → no).
 
 ## Phase 6 — Orchestrator (headless Claude Code)
 - [ ] `[H]` Build the orchestrator image from **this `autoresearch` repo**'s `Dockerfile` (Claude Code + kubectl + git + `program.md`/loop entrypoint), pushed to ACR by a human/CI.
@@ -64,9 +65,9 @@ Companion to `AUTORESEARCH_PLAN.md`. Ordered, checkable steps from zero → firs
 - [ ] `[H]` Give it the frozen `job-template.yaml`, read access to the `bg-ai` branch, and `program.md`.
   - Verify: from the orchestrator, `kubectl -n autoresearch get resourcequota` works; `kubectl -n dagster-cloud get pods` is **denied**.
 
-## Phase 7 — Noise-floor calibration (before any editing)
-- [ ] `[H/AG]` Run the **baseline** candidate 10× (training seeds 0–9, fixed split seed 42) at `budget_seconds=600`; record μ₀, σ₀ of the `validation` Spearman-r. (Plan §4)
-  - Verify: σ₀ computed and written into the keep/discard threshold; baseline μ₀ logged as run #0 in `results.tsv`.
+## Phase 7 — Noise-floor calibration (before any editing) ✅ done (2026-10-08)
+- [x] `[H/AG]` Ran the **baseline** candidate 10× (training seeds 0–9, fixed split seed 42) at `budget_seconds=600` on `dream-rc4`, 6-way on the RWX volume: **μ₀ = 0.6981, σ₀ = 0.00109** (range 0.6964–0.6997). Results in `baseline/dream/rc4/sigma0/` (`results.jsonl` + `summary.json`).
+  - **+5 % campaign bar = 1.05·μ₀ = 0.7330**; per-iteration KEEP margin ≈ 1.15·σ₀ ≈ 0.0013. σ₀ is tiny (~0.16 % of μ₀) → high sensitivity to real gains. (Driver note: cold runs take ~31 min wall-clock incl. node scale-up + 4GB pull → deadline is 2400s and the driver's wait must be ≥ deadline.)
 
 ## Phase 8 — Safety drill (do before leaving it unattended)
 - [ ] `[H]` Kill-switch test (two independent levers): (a) GPU quota — `kubectl -n autoresearch patch resourcequota autoresearch-quota -p '{"spec":{"hard":{"requests.nvidia.com/gpu":"0"}}}'` → a new Job stays Pending/denied; restore to `"1"`. (b) Orchestrator on/off — set the `orchestrator-deployment` `replicas: 0` in bg-infra, let Flux reconcile → loop halts; restore to `1`.
