@@ -1,0 +1,2 @@
+# Training logs are large/noisy; keep the score JSONs + summaries, not the raw logs.
+*.log
