@@ -21,10 +21,11 @@ FROM node:22-bookworm-slim
 # the credential helper). curl stays (the credential helper calls the GitHub API).
 # Pin kubectl near the clusters' minor (keep within one minor of the API server).
 ARG KUBECTL_VERSION=v1.31.4
-# Pin opencode for a reproducible image. CONFIRM the tag with `npm view opencode-ai
-# version` before building. NOTE: the ecosystem is migrating v1 (`opencode-ai`) -> v2
-# (`@opencode/cli`); this image + config target the v1 line.
-ARG OPENCODE_VERSION=1.18.3
+# Pin opencode for a reproducible image. v1 line (`opencode-ai`) latest = 1.18.35
+# (verified via `npm view opencode-ai version`). A v2 scoped package (`@opencode/cli`,
+# 2.0.26) now exists; this image + config (opencode.json, plugin API) target v1 — move
+# to v2 deliberately only after re-checking the config/plugin keys against v2 docs.
+ARG OPENCODE_VERSION=1.18.35
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git curl ca-certificates openssl jq \
  && curl -fsSLo /usr/local/bin/kubectl \
