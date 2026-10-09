@@ -1,0 +1,28 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "azure/brain",
+  "provider": {
+    "azure": {
+      "npm": "@ai-sdk/azure",
+      "options": {
+        "resourceName": "{env:AZURE_OPENAI_RESOURCE}",
+        "apiKey": "entra-workload-identity"
+      },
+      "models": {
+        "brain": { "id": "{env:AZURE_OPENAI_DEPLOYMENT}" }
+      }
+    }
+  },
+  "permission": {
+    "edit": {
+      "*": "deny",
+      "**/candidate.py": "allow"
+    },
+    "bash": {
+      "*": "deny",
+      "git *": "allow",
+      "kubectl *": "allow"
+    },
+    "webfetch": "deny"
+  }
+}
