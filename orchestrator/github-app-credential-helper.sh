@@ -16,6 +16,11 @@ set -euo pipefail
 [ "${1:-}" = "get" ] || exit 0
 
 : "${GITHUB_APP_ID:?}" "${GITHUB_APP_INSTALLATION_ID:?}" "${GITHUB_APP_PRIVATE_KEY_PATH:?}"
+# Down-scope the minted token to only these repos (comma-separated, no spaces) +
+# contents:write — defense-in-depth so even a leaked 1h token is narrower than the
+# installation grant. (The authoritative isolation boundary is still the App's own
+# permission set + install scope: use a DEDICATED brain App on bg-ai, not the CI/CD App.)
+GITHUB_APP_REPOSITORIES="${GITHUB_APP_REPOSITORIES:-bg-ai}"
 CACHE="${GITHUB_APP_TOKEN_CACHE:-/tmp/gh-app-token}"
 now=$(date +%s)
 token=""
@@ -38,10 +43,18 @@ if [ -z "$token" ]; then
         | openssl dgst -sha256 -sign "$GITHUB_APP_PRIVATE_KEY_PATH" -binary | b64url)
   jwt="${header}.${payload}.${sig}"
 
+  # Request a DOWN-SCOPED token: only the named repos + contents:write (+metadata).
+  # Both must be a subset of the installation's grant (they are, for the dedicated
+  # brain App) — this narrows the blast radius of the 1h token, it does not replace
+  # using a least-privilege App in the first place.
+  repos_json=$(printf '%s' "$GITHUB_APP_REPOSITORIES" | jq -R 'split(",")')
+  body=$(jq -n --argjson repos "$repos_json" \
+    '{repositories:$repos, permissions:{contents:"write", metadata:"read"}}')
   resp=$(curl -fsS -X POST \
     -H "Authorization: Bearer ${jwt}" \
     -H "Accept: application/vnd.github+json" \
     -H "X-GitHub-Api-Version: 2022-11-28" \
+    -d "$body" \
     "https://api.github.com/app/installations/${GITHUB_APP_INSTALLATION_ID}/access_tokens")
   token=$(printf '%s' "$resp" | jq -r '.token')
   [ -n "$token" ] && [ "$token" != "null" ] || { echo "github-app cred: token mint failed" >&2; exit 1; }
