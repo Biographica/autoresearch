@@ -100,19 +100,51 @@ OPENCODE_TOKEN_BUDGET="${OPENCODE_TOKEN_BUDGET:-0}"   # 0 = no cap; else pause w
 MIN_SESSION_SECONDS="${MIN_SESSION_SECONDS:-90}"      # shorter than this ⇒ treat as a stuck/fast exit
 BACKOFF_BASE="${BACKOFF_BASE:-15}"
 BACKOFF_MAX="${BACKOFF_MAX:-600}"
+WATCHDOG_INTERVAL="${WATCHDOG_INTERVAL:-60}"           # token-watchdog poll period (s)
 
-tokens_used() {  # best-effort cumulative tokens from opencode's local stats (fail-open)
-  opencode stats 2>/dev/null | awk '
-    /Input|Output|Cache Read|Cache Write/ { v=$NF; m=1;
-      if (v ~ /[Kk]/) m=1000; if (v ~ /[Mm]/) m=1000000;
-      gsub(/[^0-9.]/,"",v); sum+=v*m } END { printf "%d", sum }'
+tokens_used() {  # fail-open cumulative tokens from opencode's local stats
+  # `opencode stats` is a box table; scan each line's fields for the numeric token
+  # (NOT $NF — that's the trailing box border) and sum Input+Output+Cache{Read,Write}.
+  opencode stats 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | awk '
+    /Input|Output|Cache Read|Cache Write/ {
+      for (i=1;i<=NF;i++) if ($i ~ /^[0-9][0-9.]*[KMkm]?$/) {
+        v=$i; m=1; if (v ~ /[Kk]/) m=1000; if (v ~ /[Mm]/) m=1000000;
+        gsub(/[^0-9.]/,"",v); sum+=v*m } } END { printf "%d", sum }' || true
 }
+
+# Background watchdog: the between-session gate (top of the loop) only fires at session
+# boundaries; this kills the model loop MID-session the instant cumulative tokens cross
+# the budget, so even one long UNATTENDED session cannot overspend Foundry.
+BUDGET_HIT_FLAG=/tmp/.autoresearch_budget_hit
+rm -f "$BUDGET_HIT_FLAG"
+token_watchdog() {
+  [ "${OPENCODE_TOKEN_BUDGET}" -gt 0 ] || return 0
+  while true; do
+    sleep "${WATCHDOG_INTERVAL}"
+    u="$(tokens_used)"
+    if [ -n "$u" ] && [ "$u" -ge "${OPENCODE_TOKEN_BUDGET}" ]; then
+      echo "[orchestrator][watchdog] token budget hit (${u} >= ${OPENCODE_TOKEN_BUDGET}) — killing opencode + pausing." >&2
+      touch "$BUDGET_HIT_FLAG"; pkill -f opencode 2>/dev/null || true
+      return 0
+    fi
+  done
+}
+token_watchdog & WATCHDOG_PID=$!
+
+# Clean shutdown on scale-down (k8s SIGTERM) so the pod exits within its grace period
+# instead of being force-killed.
+cleanup() { echo "[orchestrator] signal received — shutting down"; kill "${WATCHDOG_PID}" 2>/dev/null || true; pkill -f opencode 2>/dev/null || true; exit 0; }
+trap cleanup TERM INT
 
 echo "[orchestrator] starting headless opencode loop on ${BG_AI_BRANCH} (model ${OPENCODE_MODEL})"
 echo "[orchestrator] governance: MAX_SESSIONS=${MAX_SESSIONS} OPENCODE_TOKEN_BUDGET=${OPENCODE_TOKEN_BUDGET} MIN_SESSION_SECONDS=${MIN_SESSION_SECONDS}"
 session=0
 backoff="${BACKOFF_BASE}"
 while true; do
+  if [ -f "$BUDGET_HIT_FLAG" ]; then
+    echo "[orchestrator] token budget hit (watchdog) — loop paused. Scale the Deployment 0→1 to reset." >&2
+    sleep infinity
+  fi
   if [ "${OPENCODE_TOKEN_BUDGET}" -gt 0 ]; then
     used="$(tokens_used)"
     if [ -n "${used}" ] && [ "${used}" -ge "${OPENCODE_TOKEN_BUDGET}" ]; then
