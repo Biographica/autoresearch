@@ -16,12 +16,19 @@
   "permission": {
     "edit": {
       "*": "deny",
-      "**/candidate.py": "allow"
+      "**/candidate.py": "allow",
+      "**/results.tsv": "allow",
+      "**/research_notes.md": "allow"
     },
     "bash": {
       "*": "deny",
       "git *": "allow",
-      "kubectl *": "allow"
+      "kubectl *": "allow",
+      "sed *": "allow",
+      "grep *": "allow",
+      "tail *": "allow",
+      "head *": "allow",
+      "cat *": "allow"
     },
     "webfetch": "deny"
   }

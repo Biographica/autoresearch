@@ -29,6 +29,10 @@ set -euo pipefail
 # --- optional config --------------------------------------------------------------
 export GITHUB_APP_PRIVATE_KEY_PATH="${GITHUB_APP_PRIVATE_KEY_PATH:-/secrets/github-app/private-key.pem}"
 export GITHUB_APP_ID GITHUB_APP_INSTALLATION_ID
+# The frozen eval image tag the brain renders into each Job. Exported under BOTH
+# names: program.md uses $FROZEN_IMAGE_TAG; the job-template comment still shows $TAG.
+export FROZEN_IMAGE_TAG="${FROZEN_IMAGE_TAG:-}"
+export TAG="${FROZEN_IMAGE_TAG}"
 AUTORESEARCH_NAMESPACE="${AUTORESEARCH_NAMESPACE:-autoresearch}"
 BG_AI_REPO="${BG_AI_REPO:-github.com/Biographica/bg-ai.git}"
 WORKDIR="${WORKDIR:-/work}"
@@ -41,6 +45,22 @@ echo "[orchestrator] preflight: model=${OPENCODE_MODEL} resource=${AZURE_OPENAI_
 # 1. RBAC self-check: we can see our own quota (and, by RBAC, cannot see another ns).
 echo "[orchestrator] RBAC self-check in ns=${AUTORESEARCH_NAMESPACE}"
 kubectl -n "${AUTORESEARCH_NAMESPACE}" get resourcequota
+
+# 1b. Give in-cluster kubectl a NAMED context. Without this, `kubectl config
+#     current-context` is empty and some kubectl paths fall back to localhost:8080 —
+#     which confused the brain during the first shakedown. The projected SA token + CA
+#     are the standard in-cluster paths.
+if [ -n "${KUBERNETES_SERVICE_HOST:-}" ] && [ -z "$(kubectl config current-context 2>/dev/null)" ]; then
+  SA_DIR=/var/run/secrets/kubernetes.io/serviceaccount
+  kubectl config set-cluster incluster \
+    --server="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT:-443}" \
+    --certificate-authority="${SA_DIR}/ca.crt" >/dev/null 2>&1 || true
+  kubectl config set-credentials incluster --token="$(cat "${SA_DIR}/token")" >/dev/null 2>&1 || true
+  kubectl config set-context incluster --cluster=incluster --user=incluster \
+    --namespace="${AUTORESEARCH_NAMESPACE}" >/dev/null 2>&1 || true
+  kubectl config use-context incluster >/dev/null 2>&1 || true
+  echo "[orchestrator] in-cluster kube context set (current-context=$(kubectl config current-context 2>/dev/null))"
+fi
 
 # 2. git auth via the GitHub App credential helper (mints + caches 1h installation
 #    tokens on demand, so a multi-hour loop never holds a long-lived git token).
@@ -68,9 +88,57 @@ cd ml/bg-fomo
 #    Deployment is scaled to 0 (the pod is terminated between iterations).
 #    `--auto` + the allow/deny-only permission map in opencode.json => zero prompts,
 #    so a non-TTY run never blocks.
+# --- loop governance (env-overridable from the Deployment) ------------------------
+#   The first shakedown showed a FAILURE MODE: a session that declares itself blocked
+#   exits in seconds, the loop restarts it 10s later, and each restart re-sends the
+#   full context — ~421k tokens in 6 min making zero progress. So: exponentially back
+#   off when sessions exit "fast" (likely stuck), cap total sessions, and stop when a
+#   cumulative token budget is hit. A healthy session (which spends most of its time
+#   WAITING on a 10–40 min GPU Job) resets the backoff.
+MAX_SESSIONS="${MAX_SESSIONS:-0}"                     # 0 = unlimited
+OPENCODE_TOKEN_BUDGET="${OPENCODE_TOKEN_BUDGET:-0}"   # 0 = no cap; else pause when cumulative tokens >= this
+MIN_SESSION_SECONDS="${MIN_SESSION_SECONDS:-90}"      # shorter than this ⇒ treat as a stuck/fast exit
+BACKOFF_BASE="${BACKOFF_BASE:-15}"
+BACKOFF_MAX="${BACKOFF_MAX:-600}"
+
+tokens_used() {  # best-effort cumulative tokens from opencode's local stats (fail-open)
+  opencode stats 2>/dev/null | awk '
+    /Input|Output|Cache Read|Cache Write/ { v=$NF; m=1;
+      if (v ~ /[Kk]/) m=1000; if (v ~ /[Mm]/) m=1000000;
+      gsub(/[^0-9.]/,"",v); sum+=v*m } END { printf "%d", sum }'
+}
+
 echo "[orchestrator] starting headless opencode loop on ${BG_AI_BRANCH} (model ${OPENCODE_MODEL})"
+echo "[orchestrator] governance: MAX_SESSIONS=${MAX_SESSIONS} OPENCODE_TOKEN_BUDGET=${OPENCODE_TOKEN_BUDGET} MIN_SESSION_SECONDS=${MIN_SESSION_SECONDS}"
+session=0
+backoff="${BACKOFF_BASE}"
 while true; do
+  if [ "${OPENCODE_TOKEN_BUDGET}" -gt 0 ]; then
+    used="$(tokens_used)"
+    if [ -n "${used}" ] && [ "${used}" -ge "${OPENCODE_TOKEN_BUDGET}" ]; then
+      echo "[orchestrator] TOKEN BUDGET reached (${used} >= ${OPENCODE_TOKEN_BUDGET}); pausing. Scale the Deployment 0→1 to reset." >&2
+      sleep infinity
+    fi
+  fi
+  session=$((session + 1))
+  if [ "${MAX_SESSIONS}" -gt 0 ] && [ "${session}" -gt "${MAX_SESSIONS}" ]; then
+    echo "[orchestrator] MAX_SESSIONS (${MAX_SESSIONS}) reached; pausing. Scale the Deployment 0→1 to reset." >&2
+    sleep infinity
+  fi
+
+  echo "[orchestrator] === opencode session ${session} (cumulative≈$(tokens_used) tokens) ==="
+  start="$(date +%s)"
   opencode run --auto --model "${OPENCODE_MODEL}" "$(cat program.md)" \
-    || echo "[orchestrator] opencode run exited $? — restarting after backoff"
-  sleep 10
+    || echo "[orchestrator] opencode run exited $?"
+  elapsed=$(( $(date +%s) - start ))
+
+  if [ "${elapsed}" -lt "${MIN_SESSION_SECONDS}" ]; then
+    echo "[orchestrator] session ${session} exited fast (${elapsed}s < ${MIN_SESSION_SECONDS}s) — backing off ${backoff}s" >&2
+    sleep "${backoff}"
+    backoff=$(( backoff * 2 ))
+    if [ "${backoff}" -gt "${BACKOFF_MAX}" ]; then backoff="${BACKOFF_MAX}"; fi
+  else
+    backoff="${BACKOFF_BASE}"   # a healthy (long) session resets the backoff
+    sleep 5
+  fi
 done
