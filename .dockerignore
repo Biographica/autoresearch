@@ -1,0 +1,5 @@
+# Build context for orchestrator/Dockerfile — it COPYs only from orchestrator/, so
+# exclude everything else. Keeps .git, the baseline/ eval data, notebooks, and the
+# Python/FOMO sources out of the context uploaded to `az acr build`.
+*
+!orchestrator
