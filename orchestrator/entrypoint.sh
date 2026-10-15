@@ -46,20 +46,36 @@ echo "[orchestrator] preflight: model=${OPENCODE_MODEL} resource=${AZURE_OPENAI_
 echo "[orchestrator] RBAC self-check in ns=${AUTORESEARCH_NAMESPACE}"
 kubectl -n "${AUTORESEARCH_NAMESPACE}" get resourcequota
 
-# 1b. Give in-cluster kubectl a NAMED context. Without this, `kubectl config
-#     current-context` is empty and some kubectl paths fall back to localhost:8080 —
-#     which confused the brain during the first shakedown. The projected SA token + CA
-#     are the standard in-cluster paths.
-if [ -n "${KUBERNETES_SERVICE_HOST:-}" ] && [ -z "$(kubectl config current-context 2>/dev/null)" ]; then
+# 1b. Give in-cluster kubectl a NAMED context backed by the ROTATING projected SA
+#     token. CRITICAL: use `tokenFile` (kubectl re-reads it on every call) — NOT a
+#     static `--token="$(cat …)"`. AKS projects a bound token that expires (~1h) and the
+#     kubelet refreshes the FILE; baking the string froze an expiring token, so after
+#     ~1h every call got "Unauthorized" and the loop stalled. tokenFile avoids that and
+#     still fixes the empty-current-context / localhost:8080 fallback.
+if [ -n "${KUBERNETES_SERVICE_HOST:-}" ]; then
   SA_DIR=/var/run/secrets/kubernetes.io/serviceaccount
-  kubectl config set-cluster incluster \
-    --server="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT:-443}" \
-    --certificate-authority="${SA_DIR}/ca.crt" >/dev/null 2>&1 || true
-  kubectl config set-credentials incluster --token="$(cat "${SA_DIR}/token")" >/dev/null 2>&1 || true
-  kubectl config set-context incluster --cluster=incluster --user=incluster \
-    --namespace="${AUTORESEARCH_NAMESPACE}" >/dev/null 2>&1 || true
-  kubectl config use-context incluster >/dev/null 2>&1 || true
-  echo "[orchestrator] in-cluster kube context set (current-context=$(kubectl config current-context 2>/dev/null))"
+  mkdir -p /root/.kube
+  cat > /root/.kube/config <<EOF
+apiVersion: v1
+kind: Config
+clusters:
+- name: incluster
+  cluster:
+    server: https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT:-443}
+    certificate-authority: ${SA_DIR}/ca.crt
+users:
+- name: incluster
+  user:
+    tokenFile: ${SA_DIR}/token
+contexts:
+- name: incluster
+  context:
+    cluster: incluster
+    user: incluster
+    namespace: ${AUTORESEARCH_NAMESPACE}
+current-context: incluster
+EOF
+  echo "[orchestrator] in-cluster kube context written with ROTATING tokenFile (current-context=$(kubectl config current-context 2>/dev/null))"
 fi
 
 # 2. git auth via the GitHub App credential helper (mints + caches 1h installation
