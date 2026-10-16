@@ -1,0 +1,8 @@
+{
+  "name": "autoresearch-brain-opencode-config",
+  "private": true,
+  "description": "npm deps for the opencode config dir — opencode runs `bun install` against this at startup so the Entra-auth plugin can import @azure/identity. (The azure model provider itself, @ai-sdk/azure, is installed by opencode from the provider's `npm` field in opencode.json.)",
+  "dependencies": {
+    "@azure/identity": "^4.5.0"
+  }
+}

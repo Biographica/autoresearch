@@ -1,0 +1,21 @@
+{
+    "commit": "6386cb82",
+    "seed": 0,
+    "config": "autoresearch_dream",
+    "benchmark": "dream_sequence2expression_prediction",
+    "benchmark_version": "2025-06-02_14-16-47",
+    "split_seed": 42,
+    "val_fraction": 0.2,
+    "metric": "spearman",
+    "status": "ok",
+    "spearman": 0.6981008962883656,
+    "validation_metrics": {
+        "R2.axis1": 0.3448540664490396,
+        "MAE.axis1": 0.6075601554119382,
+        "MSE.axis1": 0.6551459335509602,
+        "Pearson-r.axis1": 0.6724270332245197,
+        "Spearman-r.axis1": 0.6981008962883656
+    },
+    "peak_vram_mb": 86.72768,
+    "train_seconds": 1320.1
+}
